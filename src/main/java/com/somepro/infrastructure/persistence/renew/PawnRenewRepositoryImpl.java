@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.github.pagehelper.PageHelper;
 import com.somepro.common.exception.BizException;
+import com.somepro.domain.pawner.model.PawnerStatus;
 import com.somepro.domain.renew.model.PawnRenew;
 import com.somepro.domain.shared.model.PageResult;
 import com.somepro.domain.renew.repository.PawnRenewRepository;
@@ -56,6 +57,10 @@ import java.util.stream.Collectors;
  *    当票到期日期推进（状态仍留在当 ACTIVE）与续当登记写入在同一事务里落库，
  *    要么一起成、要么一起回滚，不会出现「票期推了、没续当记录」或反过来的裂账。
  *
+ * 4. 冻结当户挡续当
+ *    与票期推进同一把写锁、同一事务内点票面当户的状态：不是正常（冻结/注销/已销户）
+ *    一律不续，得先解冻再来。赎当不在此拦 —— 东西是人家的，冻结不影响赎当。
+ *
  * 锁的连接与时序同当票模块：用一条【独立于事务的原始连接】在事务开启前 GET_LOCK、
  * 在事务【提交之后】才 RELEASE_LOCK，避免「锁已放、事务未提交」导致后到者漏看刚推进的到期日期。
  */
@@ -71,15 +76,18 @@ public class PawnRenewRepositoryImpl implements PawnRenewRepository {
 
     private final PawnRenewMapper pawnRenewMapper;
     private final PawnTicketMapper pawnTicketMapper;
+    private final RenewPawnerQueryMapper renewPawnerQueryMapper;
     private final TransactionTemplate transactionTemplate;
     private final DataSource dataSource;
 
     public PawnRenewRepositoryImpl(PawnRenewMapper pawnRenewMapper,
                                    PawnTicketMapper pawnTicketMapper,
+                                   RenewPawnerQueryMapper renewPawnerQueryMapper,
                                    PlatformTransactionManager transactionManager,
                                    DataSource dataSource) {
         this.pawnRenewMapper = pawnRenewMapper;
         this.pawnTicketMapper = pawnTicketMapper;
+        this.renewPawnerQueryMapper = renewPawnerQueryMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.dataSource = dataSource;
     }
@@ -91,6 +99,8 @@ public class PawnRenewRepositoryImpl implements PawnRenewRepository {
             for (int attempt = 0; attempt < MAX_RETRY; attempt++) {
                 try {
                     return inWriteLock(() -> transactionTemplate.execute(status -> {
+                        // 冻结当户挡续当：锁内点票面当户状态，不是正常一律不续（赎当照常，不走这里）
+                        requireNormalPawner(renew.getTicketId());
                         // 同票同时点只续一条：条件更新「在当 + 到期日期仍是办理前那一天」才推进。
                         // 重复递交的第二笔到期日期已对不上 oldDueDate，更新 0 行，整段回滚不落记录。
                         PawnTicketPO ticketUpdate = new PawnTicketPO();
@@ -165,6 +175,24 @@ public class PawnRenewRepositoryImpl implements PawnRenewRepository {
                 PageHelper.clearPage();
             }
         });
+    }
+
+    /**
+     * 冻结/注销/已销户的当户名下当票不能续当：只在写锁事务内调用，与票期推进同一临界区。
+     * 状态口径与当户档案一致（NORMAL/FROZEN/CLOSED），不另造值。
+     */
+    private void requireNormalPawner(Long ticketId) {
+        String pawnerStatus = renewPawnerQueryMapper.findPawnerStatusByTicketId(ticketId);
+        if (PawnerStatus.NORMAL.code().equals(pawnerStatus)) {
+            return;
+        }
+        if (PawnerStatus.FROZEN.code().equals(pawnerStatus)) {
+            throw new BizException("该当户已被冻结，其名下当票不能办理续当；请先解冻再办理");
+        }
+        if (PawnerStatus.CLOSED.code().equals(pawnerStatus)) {
+            throw new BizException("该当户已注销，其名下当票不能办理续当");
+        }
+        throw new BizException("票面当户不存在或已销户，不能办理续当");
     }
 
     /**

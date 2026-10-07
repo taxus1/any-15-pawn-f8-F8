@@ -56,6 +56,14 @@ import java.util.stream.Collectors;
  *    同样在上述写锁内：取当年编号的最大整数序号 +1（序号在 Java 侧解析，
  *    避免字符串排序把 9999 排在 10000 前），锁内算号天然不撞；
  *    pawner_no 唯一索引是最后防线，极端情况下整段重试。
+ *
+ * 3. 冻结/解冻的条件迁移（幂等 + 并发）
+ *    状态只走「from → to」条件更新（UPDATE ... WHERE id AND status = from），与建档/改证
+ *    共用同一把 pawner:write 写锁，全实例串行：同一人连着点两回，第二回条件不命中、
+ *    读到已是目标状态直接返回现状（幂等，状态不来回翻）；两人几乎同时分别点冻结/解冻，
+ *    两笔在锁内排队，后落库的那笔看到的是前一笔已提交的状态，最终必是一个稳定值，
+ *    不会一笔盖着一笔乱翻。迁移真正发生时，办理时刻与经办人由审计自动填充落账
+ *    （update_time/update_by）；幂等空操作不动审计字段，首次冻结的时刻不被冲掉。
  */
 @Repository
 public class PawnerRepositoryImpl implements PawnerRepository {
@@ -142,6 +150,30 @@ public class PawnerRepositoryImpl implements PawnerRepository {
             PawnerPO po = pawnerMapper.selectById(id);
             return po == null ? null : PawnerPoConverter.toDomain(po);
         });
+    }
+
+    /**
+     * 冻结/解冻专用落库：写锁 + 事务内做「from → to」条件更新，再读本行分类结果。
+     * 状态口径只有 NORMAL/FROZEN/CLOSED 三个值，条件未命中时现态非 to 即 CLOSED：
+     * 已是 to 按幂等成功返回现状；是 CLOSED 说明档案已注销，冻结/解冻都办不了。
+     */
+    @Override
+    public Mono<Pawner> updateStatus(Long id, PawnerStatus from, PawnerStatus to) {
+        return blocking(() -> inWriteLock(() -> transactionTemplate.execute(status -> {
+            PawnerPO update = new PawnerPO();
+            update.setStatus(to.code());
+            int rows = pawnerMapper.update(update, Wrappers.<PawnerPO>lambdaUpdate()
+                    .eq(PawnerPO::getId, id)
+                    .eq(PawnerPO::getStatus, from.code()));
+            PawnerPO current = pawnerMapper.selectById(id);
+            if (current == null) {
+                throw new BizException("当户不存在");
+            }
+            if (rows == 0 && !to.code().equals(current.getStatus())) {
+                throw new BizException("当户已注销，不能办理冻结/解冻；注销档案需按历史档案单独处理");
+            }
+            return PawnerPoConverter.toDomain(current);
+        })));
     }
 
     @Override

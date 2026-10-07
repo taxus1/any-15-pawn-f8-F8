@@ -7,6 +7,7 @@ import com.github.pagehelper.PageHelper;
 import com.somepro.common.exception.BizException;
 import com.somepro.domain.collateral.model.Category;
 import com.somepro.domain.collateral.model.CollateralStatus;
+import com.somepro.domain.pawner.model.PawnerStatus;
 import com.somepro.domain.shared.model.PageResult;
 import com.somepro.domain.ticket.model.PawnTicket;
 import com.somepro.domain.ticket.model.PawnTicketQuery;
@@ -57,6 +58,12 @@ import java.util.stream.Collectors;
  *    开票把当物置「已典当」、撤销把当物回「在库」，与当票写入在同一事务里落库，
  *    票和物的状态要么一起成、要么一起回滚，不会出现「票开着、物在库」的裂账。
  *
+ * 4. 冻结当户挡开票
+ *    与「一物一票」同一把写锁、同一事务内点当户状态：不是正常（冻结/注销/已销户）
+ *    一律不开票。冻结与开票并发时，锁内这一读把开票挡在冻结生效之后，
+ *    柜台给冻结户开票收到的是业务提示而不是开出一张不该开的票。
+ *    赎当、续当不在这里拦（赎当照常；续当在续当仓储里拦）。
+ *
  * 锁的连接与时序同当户/当物模块：用一条【独立于事务的原始连接】在事务开启前 GET_LOCK、
  * 在事务【提交之后】才 RELEASE_LOCK，避免「锁已放、事务未提交」导致后到者算重号、漏看在当票。
  */
@@ -72,15 +79,18 @@ public class PawnTicketRepositoryImpl implements PawnTicketRepository {
 
     private final PawnTicketMapper pawnTicketMapper;
     private final TicketCollateralMapper ticketCollateralMapper;
+    private final TicketPawnerQueryMapper ticketPawnerQueryMapper;
     private final TransactionTemplate transactionTemplate;
     private final DataSource dataSource;
 
     public PawnTicketRepositoryImpl(PawnTicketMapper pawnTicketMapper,
                                     TicketCollateralMapper ticketCollateralMapper,
+                                    TicketPawnerQueryMapper ticketPawnerQueryMapper,
                                     PlatformTransactionManager transactionManager,
                                     DataSource dataSource) {
         this.pawnTicketMapper = pawnTicketMapper;
         this.ticketCollateralMapper = ticketCollateralMapper;
+        this.ticketPawnerQueryMapper = ticketPawnerQueryMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.dataSource = dataSource;
     }
@@ -92,6 +102,8 @@ public class PawnTicketRepositoryImpl implements PawnTicketRepository {
             for (int attempt = 0; attempt < MAX_RETRY; attempt++) {
                 try {
                     return inWriteLock(() -> transactionTemplate.execute(status -> {
+                        // 冻结当户挡开票：锁内点当户状态，不是正常一律不开（赎当照常，不走这里）
+                        requireNormalPawner(ticket.getPawnerId());
                         // 一物一票：锁内点在当票，同一件东西前后脚来两张也只落得了一张
                         if (pawnTicketMapper.countActiveByCollateral(ticket.getCollateralId()) > 0) {
                             throw new BizException("该当物已有一张在当的当票，一票未结不能再开；请先结清原票");
@@ -213,6 +225,24 @@ public class PawnTicketRepositoryImpl implements PawnTicketRepository {
                 PageHelper.clearPage();
             }
         });
+    }
+
+    /**
+     * 冻结/注销/已销户的当户不能开新当票：只在写锁事务内调用，与「一物一票」同一临界区。
+     * 状态口径与当户档案一致（NORMAL/FROZEN/CLOSED），不另造值。
+     */
+    private void requireNormalPawner(Long pawnerId) {
+        String pawnerStatus = ticketPawnerQueryMapper.findStatusByPawnerId(pawnerId);
+        if (PawnerStatus.NORMAL.code().equals(pawnerStatus)) {
+            return;
+        }
+        if (PawnerStatus.FROZEN.code().equals(pawnerStatus)) {
+            throw new BizException("该当户已被冻结，名下不能再开新当票；如需办理请先解冻");
+        }
+        if (PawnerStatus.CLOSED.code().equals(pawnerStatus)) {
+            throw new BizException("该当户已注销，不能开新当票");
+        }
+        throw new BizException("当户不存在或已销户，不能开新当票");
     }
 
     /**

@@ -59,6 +59,38 @@ public class PawnerController {
                 .map(Result::ok);
     }
 
+    /**
+     * 冻结：正常 → 冻结，重复点状态不再变；办理时刻与经办人由审计落账。
+     * 冻结后名下开不了新当票、办不了续当，赎当照常。
+     */
+    @PostMapping("/freeze")
+    public Mono<Result<PawnerVO>> freeze(@ModelAttribute PawnerIdRequest request) {
+        return pawnerAppService.freeze(request.getId())
+                .map(PawnerVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /** 解冻：冻结 → 正常，重复点状态不再变；已注销的当户不能解，会单独提示。 */
+    @PostMapping("/unfreeze")
+    public Mono<Result<PawnerVO>> unfreeze(@ModelAttribute PawnerIdRequest request) {
+        return pawnerAppService.unfreeze(request.getId())
+                .map(PawnerVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /**
+     * 翻冻结名单：默认只出冻结中的当户，也可显式按状态查（NORMAL/FROZEN）；
+     * 已注销、已删除的当户不进这份名单。一页一页走，每行带 pawnerNo 便于柜面盯人。
+     */
+    @GetMapping("/freeze/list")
+    public Mono<Result<PageVO<PawnerVO>>> freezeList(@RequestParam(defaultValue = "1") int pageNum,
+                                                     @RequestParam(defaultValue = "20") int pageSize,
+                                                     @RequestParam(required = false) String status) {
+        return pawnerAppService.freezePage(pageNum, pageSize, status)
+                .map(PawnerVoConverter::toPageVo)
+                .map(Result::ok);
+    }
+
     /** 详情：id 或 pawnerNo 任一指定；带出在押/在库/在当当票三个对账数。 */
     @GetMapping("/detail")
     public Mono<Result<PawnerDetailVO>> detail(@RequestParam(required = false) Long id,

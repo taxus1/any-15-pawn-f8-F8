@@ -62,6 +62,29 @@ public class Pawner extends BaseEntity {
         applyProfile(name, idCard, phone, address);
     }
 
+    /**
+     * 冻结：正常 → 冻结。连着点两回是幂等空操作（已在冻结不再变），
+     * 已注销的档案是历史档案，不能冻结。
+     * 并发下「冻结与解冻同时点」的最终落库值由仓储的条件更新兜底，这里只守单档案规则。
+     */
+    public void freeze() {
+        if (status == PawnerStatus.CLOSED) {
+            throw new BizException("当户已注销，不能冻结");
+        }
+        this.status = PawnerStatus.FROZEN;
+    }
+
+    /**
+     * 解冻：冻结 → 正常。连着点两回是幂等空操作（已是正常不再变）；
+     * 已注销的档案不能解冻 —— 注销是终态，不在冻结/解冻这条线上，得按历史档案单独处理。
+     */
+    public void unfreeze() {
+        if (status == PawnerStatus.CLOSED) {
+            throw new BizException("当户已注销，不能解冻；注销档案需按历史档案单独处理");
+        }
+        this.status = PawnerStatus.NORMAL;
+    }
+
     /** 在 NORMAL / FROZEN 之间切换；仅应用层在明确「冻结/解冻」语义时使用。 */
     public void changeStatus(PawnerStatus target) {
         if (target == null) {
